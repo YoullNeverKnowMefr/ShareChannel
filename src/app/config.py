@@ -29,7 +29,7 @@ class AppSettings(BaseSettings):
     use_redis: bool = Field(True, alias="USE_REDIS")
     global_rate_limit_per_sec: float = Field(1.0, alias="GLOBAL_RATE_LIMIT_PER_SEC")
     chat_rate_limit_per_sec: float = Field(1.0, alias="CHAT_RATE_LIMIT_PER_SEC")
-    new_post_delay_seconds: int = Field(300, alias="NEW_POST_DELAY_SECONDS")
+    new_post_delay_seconds: int = Field(45, alias="NEW_POST_DELAY_SECONDS")
     hash_rounds: int = Field(12, alias="HASH_ROUNDS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     sentry_dsn: str | None = Field(default=None, alias="SENTRY_DSN")

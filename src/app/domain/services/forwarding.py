@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Sequence
@@ -17,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.db import get_session
-from app.core.limiter import RateLimiterSet, rate_limiters
+from app.core.limiter import RateLimiterSet, bot_post_cooldowns, rate_limiters
 from app.core.logging import get_logger
 from app.core.redis import redis_lock
 from app.core.scheduler import scheduler
@@ -560,44 +559,43 @@ class ForwardingService:
         message: TlMessage,
         media_group: Optional[List[TlMessage]],
     ) -> List[BotMessage]:
-        async with rate_limiters.throttle(chain.sink_chat_id):
-            await asyncio.sleep(random.uniform(0.2, 0.8))
-            
-            caption = sanitize(message.message or message.raw_text)
-            
-            if media_group and len(media_group) > 1:
-                payload = await self._album_payload(media_group, caption)
-                result = await self.bot.send_media_group(
+        async with bot_post_cooldowns.throttle(chain.sink_chat_id):
+            async with rate_limiters.throttle(chain.sink_chat_id):
+                caption = sanitize(message.message or message.raw_text)
+
+                if media_group and len(media_group) > 1:
+                    payload = await self._album_payload(media_group, caption)
+                    result = await self.bot.send_media_group(
+                        chain.sink_chat_id,
+                        media=payload,
+                    )
+                    return result if result else []
+
+                if message.photo:
+                    data = await self._download_media(message)
+                    buff = BufferedInputFile(data, filename=f"{message.id}.jpg")
+                    return [await self.bot.send_photo(
+                        chain.sink_chat_id,
+                        photo=buff,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )]
+
+                if message.video or message.document:
+                    data = await self._download_media(message)
+                    buff = BufferedInputFile(data, filename=f"{message.id}.mp4")
+                    return [await self.bot.send_video(
+                        chain.sink_chat_id,
+                        video=buff,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )]
+
+                return [await self.bot.send_message(
                     chain.sink_chat_id,
-                    media=payload,
-                )
-                return result if result else []
-            
-            if message.photo:
-                data = await self._download_media(message)
-                buff = BufferedInputFile(data, filename=f"{message.id}.jpg")
-                return [await self.bot.send_photo(
-                    chain.sink_chat_id,
-                    photo=buff,
-                    caption=caption,
+                    text=caption or "",
                     parse_mode=ParseMode.HTML,
                 )]
-            
-            if message.video or message.document:
-                data = await self._download_media(message)
-                buff = BufferedInputFile(data, filename=f"{message.id}.mp4")
-                return [await self.bot.send_video(
-                    chain.sink_chat_id,
-                    video=buff,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )]
-            
-            return [await self.bot.send_message(
-                chain.sink_chat_id,
-                text=caption or "",
-                parse_mode=ParseMode.HTML,
-            )]
 
 
 
