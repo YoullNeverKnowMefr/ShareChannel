@@ -7,7 +7,7 @@ from typing import List, Optional, Sequence
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, InputMediaPhoto, InputMediaVideo, Message as BotMessage
 from structlog.stdlib import BoundLogger
 from telethon.errors import FloodWaitError, RPCError
@@ -51,12 +51,21 @@ class ForwardingService:
         self.bot = bot
         self.logger: BoundLogger = get_logger(__name__)
 
+    def _log_chain_skipped(self, chain_id: int, reason: str, **fields: object) -> None:
+        self.logger.info(
+            "chain_skipped",
+            chain_id=chain_id,
+            reason=reason,
+            message="chain skipped, other chains continue",
+            **fields,
+        )
+
     async def process_chain(self, chain_id: int, bypass_pickup_delay: bool = False) -> None:
         lock_key = f"chain:{chain_id}:lock"
 
         async with redis_lock(lock_key, ttl=300) as acquired:
             if not acquired:
-                self.logger.info("forwarding_lock_busy", chain_id=chain_id)
+                self._log_chain_skipped(chain_id, "lock_busy")
                 return
 
             async with get_session() as session:
@@ -67,13 +76,13 @@ class ForwardingService:
                     return
 
                 if chain.status != models.ChainStatus.ACTIVE:
-                    self.logger.info("chain_not_active", chain_id=chain_id, status=chain.status.value)
+                    self._log_chain_skipped(chain_id, "not_active", status=chain.status.value)
                     return
 
                 try:
                     message = await self._find_unpublished_message(chain, bypass_pickup_delay, session)
                 except RuntimeError as exc:
-                    self.logger.warning("no_observer_available", chain_id=chain.id, error=str(exc))
+                    self._log_chain_skipped(chain.id, "no_observer", error=str(exc))
                     await notify_admins(
                         "⚠️ Нет доступного аккаунта-наблюдателя — пересылка приостановлена.\n"
                         "Добавьте или переподключите Telethon-аккаунт: 🛡 Безопасность → 🔑 Telethon аккаунты.",
@@ -83,10 +92,7 @@ class ForwardingService:
                     return
 
                 if message is None:
-                    self.logger.debug(
-                        "no_new_messages",
-                        chain_id=chain.id,
-                    )
+                    self._log_chain_skipped(chain.id, "no_new_messages")
                     return
 
                 await self._send_message(chain, message, session)
@@ -390,9 +396,9 @@ class ForwardingService:
 
         existing = await repository.get_by_source(chain.id, message.id)
         if existing:
-            self.logger.info(
+            self._log_chain_skipped(
+                chain.id,
                 "already_published",
-                chain_id=chain.id,
                 source_msg_id=message.id,
                 number_tag=existing.number_tag,
             )
@@ -400,7 +406,7 @@ class ForwardingService:
 
         number_tag = extract_number_tag(message.message or message.raw_text)
         if number_tag is None:
-            self.logger.error("message_without_number", chain_id=chain.id, message_id=message.id)
+            self._log_chain_skipped(chain.id, "message_without_number", source_msg_id=message.id)
             return
 
         media_group = await self._collect_album(message) if message.grouped_id else None
@@ -413,6 +419,13 @@ class ForwardingService:
                 break
             except TelegramRetryAfter as exc:
                 await self._record_rate_limit(chain, exc.retry_after)
+                self.logger.warning(
+                    "bot_flood_wait_retry",
+                    chain_id=chain.id,
+                    attempt=attempt,
+                    retry_after=exc.retry_after,
+                    sink_chat_id=chain.sink_chat_id,
+                )
                 await notify_admins(
                     f"⏳ Цепочка #{chain.id}: лимит Telegram (FloodWait {exc.retry_after}с), ждём и повторяем.",
                     dedup_key=f"pub_flood:{chain.id}",
@@ -426,11 +439,41 @@ class ForwardingService:
                 return
             except Exception as exc:
                 last_error = exc
+                if self._is_bot_flood_error(exc):
+                    self.logger.warning(
+                        "bot_flood_wait_retry",
+                        chain_id=chain.id,
+                        attempt=attempt,
+                        error=str(exc),
+                        sink_chat_id=chain.sink_chat_id,
+                    )
+                    await asyncio.sleep(min(8 * attempt, 30))
+                    continue
                 self.logger.warning("deliver_retry", chain_id=chain.id, attempt=attempt, error=str(exc))
                 await asyncio.sleep(min(5 * attempt, 15))
                 continue
 
         if sent_messages is None:
+            # FloodWait бота: не останавливаем цепочку, пропускаем тик и идём дальше.
+            if isinstance(last_error, TelegramRetryAfter) or self._is_bot_flood_error(last_error):
+                retry_after = getattr(last_error, "retry_after", None)
+                self._log_chain_skipped(
+                    chain.id,
+                    "bot_flood_wait",
+                    retry_after=retry_after,
+                    sink_chat_id=chain.sink_chat_id,
+                    source_msg_id=message.id,
+                    error=str(last_error),
+                )
+                await notify_admins(
+                    f"⏭️ Цепочка #{chain.id}: пропущена из‑за FloodWait бота"
+                    + (f" ({retry_after}с)" if retry_after else "")
+                    + ". Цепочка активна, повтор на следующем интервале.",
+                    dedup_key=f"chain_skip_flood:{chain.id}",
+                    cooldown_seconds=180,
+                )
+                return
+
             await self._mark_chain_error(
                 chain,
                 f"Не удалось скопировать пост после 3 попыток: {last_error}",
@@ -492,6 +535,13 @@ class ForwardingService:
                 until=datetime.now(timezone.utc) + timedelta(seconds=retry_after),
                 meta={"chain_id": chain.id},
             )
+
+    @staticmethod
+    def _is_bot_flood_error(exc: object) -> bool:
+        if isinstance(exc, TelegramRetryAfter):
+            return True
+        text = str(exc).lower()
+        return "flood control" in text or "too many requests" in text or "retry after" in text
 
     @staticmethod
     def _error_side(exc: object) -> str:
