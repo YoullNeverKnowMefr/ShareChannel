@@ -34,7 +34,7 @@ def security_menu_keyboard() -> InlineKeyboardBuilder:
     builder.button(text="📋 История входов", callback_data="security:login_history")
     builder.button(text="♻️ Обнулить попытки", callback_data="security:reset")
     builder.button(text="🔑 Telethon аккаунты", callback_data="accounts:menu")
-    builder.button(text="💾 Бэкап базы", callback_data="security:backup")
+    builder.button(text="💾 Бэкап базы в канал", callback_data="security:backup")
     builder.button(text="⬅️ Назад", callback_data="menu:home")
     builder.adjust(1)
     return builder

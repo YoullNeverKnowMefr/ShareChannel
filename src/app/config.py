@@ -30,6 +30,8 @@ class AppSettings(BaseSettings):
     global_rate_limit_per_sec: float = Field(1.0, alias="GLOBAL_RATE_LIMIT_PER_SEC")
     chat_rate_limit_per_sec: float = Field(1.0, alias="CHAT_RATE_LIMIT_PER_SEC")
     new_post_delay_seconds: int = Field(45, alias="NEW_POST_DELAY_SECONDS")
+    backup_chat_id: int | None = Field(default=None, alias="BACKUP_CHAT_ID")
+    backup_interval_hours: float = Field(18.0, alias="BACKUP_INTERVAL_HOURS")
     hash_rounds: int = Field(12, alias="HASH_ROUNDS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     sentry_dsn: str | None = Field(default=None, alias="SENTRY_DSN")

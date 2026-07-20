@@ -16,6 +16,7 @@ from app.core.logging import configure_logging, get_logger
 from app.core.scheduler import scheduler
 from app.domain.models import ChainStatus
 from app.domain.repositories import ChainRepository
+from app.domain.services.backup_service import BackupService
 from app.domain.services.deletion_sync import DeletionSyncService
 from app.domain.services.forwarding import ForwardingService, extract_number_tag
 from app.domain.services.account_manager import account_manager
@@ -107,6 +108,28 @@ async def main() -> None:
     await account_manager.start()
 
     await schedule_existing_chains(forwarding_service)
+
+    backup_service = BackupService(bot)
+    dp["backup_service"] = backup_service
+    if settings.backup_chat_id is not None:
+        interval_seconds = max(1.0, settings.backup_interval_hours) * 3600
+        scheduler.add_interval_job(
+            backup_service.run_scheduled_backup,
+            job_id="db_backup",
+            seconds=interval_seconds,
+        )
+        scheduler.add_one_off_job(
+            backup_service.run_scheduled_backup,
+            job_id="db_backup:bootstrap",
+            run_date=datetime.now(timezone.utc) + timedelta(minutes=2),
+        )
+        logger.info(
+            "backup_scheduler_enabled",
+            chat_id=settings.backup_chat_id,
+            interval_hours=settings.backup_interval_hours,
+        )
+    else:
+        logger.warning("backup_scheduler_disabled", reason="BACKUP_CHAT_ID not set")
 
     async def new_message_handler(event: events.NewMessage.Event) -> None:
         await handle_new_message(event, forwarding_service)

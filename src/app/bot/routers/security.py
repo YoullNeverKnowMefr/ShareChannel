@@ -26,53 +26,28 @@ class SecurityStates(StatesGroup):
 
 @router.callback_query(F.data == "security:backup", authorized_filter)
 async def security_backup(callback: CallbackQuery) -> None:
-    import asyncio
-    import os
-    import sqlite3
-    import tempfile
-    from datetime import datetime
-    from aiogram.types import FSInputFile
     from app.config import settings
+    from app.domain.services.backup_service import BackupService
 
-    url = settings.database_url
-    if not url.startswith("sqlite"):
-        await callback.answer("Бэкап доступен только для SQLite-базы", show_alert=True)
+    if settings.backup_chat_id is None:
+        await callback.answer(
+            "Не задан BACKUP_CHAT_ID в .env",
+            show_alert=True,
+        )
         return
-
-    raw = url.split("///", 1)[-1]
-    db_path = raw if os.path.isabs(raw) else str((settings.project_root / raw).resolve())
-    if not os.path.exists(db_path):
-        await callback.answer("Файл базы не найден", show_alert=True)
-        return
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(tempfile.gettempdir(), f"sharechannel_backup_{ts}.sqlite3")
-
-    def do_backup() -> None:
-        src = sqlite3.connect(db_path)
-        dst = sqlite3.connect(backup_path)
-        try:
-            with dst:
-                src.backup(dst)
-        finally:
-            dst.close()
-            src.close()
 
     await callback.answer("Готовлю резервную копию...")
     try:
-        await asyncio.to_thread(do_backup)
-        size_kb = os.path.getsize(backup_path) // 1024
-        await callback.message.answer_document(
-            FSInputFile(backup_path, filename=f"sharechannel_backup_{ts}.sqlite3"),
-            caption=f"💾 Резервная копия базы ({size_kb} КБ).\nСохраните файл в надёжном месте.",
-        )
+        backup = BackupService(callback.bot)
+        filename = await backup.send_backup(reason="manual")
+        if callback.message:
+            await callback.message.answer(
+                f"✅ Бэкап отправлен в чат <code>{settings.backup_chat_id}</code>\n"
+                f"Файл: <code>{filename}</code>"
+            )
     except Exception as exc:
-        await callback.message.answer(f"❌ Не удалось создать бэкап: {exc}")
-    finally:
-        try:
-            os.remove(backup_path)
-        except Exception:
-            pass
+        if callback.message:
+            await callback.message.answer(f"❌ Не удалось создать бэкап: {exc}")
 
 
 @router.callback_query(F.data == "security:menu", authorized_filter)
