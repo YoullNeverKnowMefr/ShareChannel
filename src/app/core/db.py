@@ -40,6 +40,14 @@ engine: AsyncEngine = _create_engine()
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+async def recreate_engine() -> None:
+    """Пересоздать engine после замены файла SQLite на диске."""
+    global engine, SessionLocal
+    await engine.dispose()
+    engine = _create_engine()
+    SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
 @asynccontextmanager
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
@@ -54,4 +62,4 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         await session.close()
 
 
-__all__ = ["Base", "engine", "get_session", "SessionLocal"]
+__all__ = ["Base", "engine", "get_session", "SessionLocal", "recreate_engine"]

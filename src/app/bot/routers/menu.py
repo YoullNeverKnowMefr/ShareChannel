@@ -12,7 +12,12 @@ router = Router(name="menu")
 
 
 @router.message(Command("menu"), authorized_filter)
-async def menu_command(message: Message) -> None:
+async def menu_command(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    is_authorized = data.get("authorized", False)
+    await state.clear()
+    if is_authorized:
+        await state.update_data(authorized=True)
     await message.answer(
         "Главное меню:",
         reply_markup=main_menu_keyboard().as_markup(),

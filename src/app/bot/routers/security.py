@@ -22,6 +22,29 @@ class SecurityStates(StatesGroup):
     waiting_new = State()
     waiting_confirm = State()
     waiting_pickup_delay = State()
+    waiting_db_upload = State()
+
+
+@router.callback_query(F.data == "security:backup_chat", authorized_filter)
+async def security_backup_to_chat(callback: CallbackQuery) -> None:
+    from app.domain.services.backup_service import BackupService
+
+    chat_id = callback.message.chat.id if callback.message else None
+    if chat_id is None:
+        await callback.answer("Не удалось определить чат", show_alert=True)
+        return
+
+    await callback.answer("Готовлю резервную копию...")
+    try:
+        backup = BackupService(callback.bot)
+        filename = await backup.send_backup_to_chat(chat_id, reason="manual")
+        if callback.message:
+            await callback.message.answer(
+                f"✅ База отправлена в этот чат.\nФайл: <code>{filename}</code>"
+            )
+    except Exception as exc:
+        if callback.message:
+            await callback.message.answer(f"❌ Не удалось создать бэкап: {exc}")
 
 
 @router.callback_query(F.data == "security:backup", authorized_filter)
@@ -39,15 +62,128 @@ async def security_backup(callback: CallbackQuery) -> None:
     await callback.answer("Готовлю резервную копию...")
     try:
         backup = BackupService(callback.bot)
-        filename = await backup.send_backup(reason="manual")
+        filename = await backup.send_backup(reason="channel")
         if callback.message:
             await callback.message.answer(
-                f"✅ Бэкап отправлен в чат <code>{settings.backup_chat_id}</code>\n"
+                f"✅ Бэкап отправлен в канал <code>{settings.backup_chat_id}</code>\n"
                 f"Файл: <code>{filename}</code>"
             )
     except Exception as exc:
         if callback.message:
             await callback.message.answer(f"❌ Не удалось создать бэкап: {exc}")
+
+
+@router.callback_query(F.data == "security:restore", authorized_filter)
+async def security_restore_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SecurityStates.waiting_db_upload)
+    await state.update_data(authorized=True)
+    if callback.message:
+        await callback.message.answer(
+            "📥 Загрузка базы данных\n\n"
+            "Пришлите файл <code>.sqlite3</code> / <code>.db</code> ответом в этот чат.\n\n"
+            "⚠️ Текущая база будет заменена. Перед заменой сохранится копия "
+            "<code>*.before_restore_*</code> рядом с файлом БД.\n"
+            "После загрузки бот переподключит аккаунты и цепочки.\n\n"
+            "Отмена: /menu"
+        )
+    await callback.answer()
+
+
+@router.message(SecurityStates.waiting_db_upload, F.document, authorized_filter)
+async def security_restore_document(message: Message, state: FSMContext) -> None:
+    import os
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+    import random
+
+    from app.core.scheduler import scheduler
+    from app.domain.repositories import ChainRepository
+    from app.domain.services.account_manager import account_manager
+    from app.domain.services.backup_service import BackupService
+    from app.domain.services.forwarding import ForwardingService
+    from app.core.db import get_session
+
+    document = message.document
+    if document is None:
+        await message.answer("Пришлите именно файл-документ базы данных.")
+        return
+
+    name = (document.file_name or "").lower()
+    if not (name.endswith(".sqlite3") or name.endswith(".sqlite") or name.endswith(".db")):
+        await message.answer(
+            "❌ Нужен файл с расширением <code>.sqlite3</code>, <code>.sqlite</code> или <code>.db</code>."
+        )
+        return
+
+    # Telegram Bot API limit for download via bot is typically 20 MB
+    if document.file_size and document.file_size > 20 * 1024 * 1024:
+        await message.answer("❌ Файл больше 20 МБ — Telegram не даст скачать его боту.")
+        return
+
+    await message.answer("⏳ Скачиваю и проверяю базу...")
+
+    tmp_path = os.path.join(
+        tempfile.gettempdir(),
+        f"sharechannel_upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3",
+    )
+    try:
+        await message.bot.download(document, destination=tmp_path)
+        backup = BackupService(message.bot)
+        safety_path = await backup.restore_from_path(tmp_path)
+
+        # Перезапуск пула аккаунтов и расписания цепочек под новую БД
+        await account_manager.stop()
+        await account_manager.start()
+
+        for job in list(scheduler.scheduler.get_jobs()):
+            job_id = str(job.id)
+            if job_id.startswith("chain:"):
+                scheduler.remove(job_id)
+
+        forwarding = ForwardingService(message.bot)
+        async with get_session() as session:
+            chains = await ChainRepository(session).list_active()
+        for chain in chains:
+            scheduler.add_interval_job(
+                forwarding.process_chain,
+                job_id=f"chain:{chain.id}",
+                seconds=chain.interval_seconds,
+                kwargs={"chain_id": chain.id},
+            )
+            scheduler.add_one_off_job(
+                forwarding.process_chain,
+                job_id=f"chain:{chain.id}:bootstrap",
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=random.uniform(1, 5)),
+                kwargs={"chain_id": chain.id},
+            )
+
+        data = await state.get_data()
+        is_authorized = data.get("authorized", False)
+        await state.clear()
+        if is_authorized:
+            await state.update_data(authorized=True)
+
+        await message.answer(
+            "✅ База успешно загружена и применена.\n"
+            f"Копия старой БД: <code>{safety_path}</code>\n"
+            f"Активных цепочек после загрузки: <b>{len(chains)}</b>\n\n"
+            "Проверьте Telethon-аккаунты и цепочки в меню.",
+            reply_markup=security_menu_keyboard().as_markup(),
+        )
+    except Exception as exc:
+        await message.answer(f"❌ Не удалось загрузить базу: {exc}")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+@router.message(SecurityStates.waiting_db_upload, authorized_filter)
+async def security_restore_not_document(message: Message) -> None:
+    await message.answer(
+        "Пришлите файл базы (<code>.sqlite3</code>) или нажмите /menu для отмены."
+    )
 
 
 @router.callback_query(F.data == "security:menu", authorized_filter)
