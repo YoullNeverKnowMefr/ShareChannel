@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
@@ -30,7 +31,7 @@ from app.domain.services.text_sanitizer import sanitize
 NUMBER_PATTERN = re.compile(r"(?<!\w)#(\d{1,10})\b")
 MAX_HISTORY_SCAN = 2000
 START_SEARCH_LIMIT = 10000
-SINK_DEDUP_SCAN = 200
+SINK_DEDUP_SCAN = 300
 
 history_limiters = RateLimiterSet()
 
@@ -410,46 +411,42 @@ class ForwardingService:
             self._log_chain_skipped(chain.id, "message_without_number", source_msg_id=message.id)
             return
 
-        # Уже есть в БД по номеру (на случай рассинхрона source_msg_id).
-        existing_by_number = await repository.get_last_by_number(chain.id, number_tag)
-        if existing_by_number is not None:
-            await ChainRepository(session).advance_pointer(
-                chain_id=chain.id,
-                next_expected_number=number_tag + 1,
-                last_sent_number=number_tag,
-            )
-            self._log_chain_skipped(
-                chain.id,
-                "already_published_by_number",
-                source_msg_id=message.id,
-                number_tag=number_tag,
-                sink_msg_id=existing_by_number.sink_msg_id,
-            )
-            return
-
-        # Пост уже в приёмнике (после отката БД) — не дублируем, только синхронизируем карту.
-        sink_existing = await self._find_number_in_sink(chain.sink_chat_id, number_tag)
-        if sink_existing is not None:
-            media_group = await self._collect_album(message) if message.grouped_id else None
-            await self._register_without_send(
-                chain=chain,
-                message=message,
-                media_group=media_group,
-                number_tag=number_tag,
-                sink_msg_id=sink_existing.id,
-                sink_msg_date=self._ensure_aware(sink_existing.date),
-                session=session,
-            )
-            self.logger.info(
-                "duplicate_avoided_sink_match",
-                chain_id=chain.id,
-                source_msg_id=message.id,
-                sink_msg_id=sink_existing.id,
-                number_tag=number_tag,
-            )
-            return
-
         media_group = await self._collect_album(message) if message.grouped_id else None
+
+        # Дедуп по содержимому (не по #N): одинаковый номер + разные картинки — оба поста уйдут.
+        # Если тот же файл уже в приёмнике (откат БД) — только пишем в message_map.
+        try:
+            fingerprint = await self._message_fingerprint(message, media_group)
+            sink_existing = await self._find_fingerprint_in_sink(
+                chain.sink_chat_id,
+                fingerprint,
+                number_tag=number_tag,
+            )
+            if sink_existing is not None:
+                await self._register_without_send(
+                    chain=chain,
+                    message=message,
+                    media_group=media_group,
+                    number_tag=number_tag,
+                    sink_msg_id=sink_existing.id,
+                    sink_msg_date=self._ensure_aware(sink_existing.date),
+                    session=session,
+                )
+                self.logger.info(
+                    "duplicate_avoided_content_match",
+                    chain_id=chain.id,
+                    source_msg_id=message.id,
+                    sink_msg_id=sink_existing.id,
+                    number_tag=number_tag,
+                )
+                return
+        except Exception as exc:
+            self.logger.warning(
+                "content_dedup_failed",
+                chain_id=chain.id,
+                source_msg_id=message.id,
+                error=str(exc),
+            )
 
         sent_messages = None
         last_error = None
@@ -562,8 +559,68 @@ class ForwardingService:
             number_tag=number_tag,
         )
 
-    async def _find_number_in_sink(self, sink_chat_id: int, number_tag: int) -> Optional[TlMessage]:
-        """Ищет в приёмнике уже опубликованный пост с тем же #N. Ошибки не роняют цепочку."""
+    async def _message_fingerprint(
+        self,
+        message: TlMessage,
+        media_group: Optional[List[TlMessage]] = None,
+    ) -> str:
+        """Отпечаток содержимого: одинаковый #N + разные картинки → разные fingerprint."""
+        parts: list[str] = []
+        number = extract_number_tag(message.message or message.raw_text)
+        if number is not None:
+            parts.append(f"n{number}")
+
+        media_list = media_group if media_group and len(media_group) > 1 else [message]
+        for part in media_list:
+            try:
+                if part.photo or part.video or part.document:
+                    data = await part.download_media(bytes)
+                    if data:
+                        parts.append(hashlib.sha256(data).hexdigest())
+                        continue
+            except Exception as exc:
+                self.logger.debug("fingerprint_media_failed", error=str(exc), msg_id=part.id)
+            text = (part.text or part.message or "").strip()
+            parts.append("t:" + hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest())
+
+        return "|".join(parts) if parts else f"id:{message.id}"
+
+    async def _build_sink_fingerprint_index(
+        self,
+        sink_chat_id: int,
+    ) -> Dict[str, TlMessage]:
+        index: Dict[str, TlMessage] = {}
+        try:
+            async for sink_msg in account_manager.iter_messages(
+                sink_chat_id,
+                limit=SINK_DEDUP_SCAN,
+                reverse=False,
+            ):
+                try:
+                    album = None
+                    if sink_msg.grouped_id:
+                        album = await self._collect_album(sink_msg)
+                    fp = await self._message_fingerprint(sink_msg, album)
+                    # Первый встреченный (более новый при reverse=False от новых к старым) оставляем
+                    if fp not in index:
+                        index[fp] = sink_msg
+                except Exception:
+                    continue
+        except Exception as exc:
+            self.logger.warning(
+                "sink_fingerprint_index_failed",
+                sink_chat_id=sink_chat_id,
+                error=str(exc),
+            )
+        return index
+
+    async def _find_fingerprint_in_sink(
+        self,
+        sink_chat_id: int,
+        fingerprint: str,
+        *,
+        number_tag: Optional[int] = None,
+    ) -> Optional[TlMessage]:
         try:
             async for sink_msg in account_manager.iter_messages(
                 sink_chat_id,
@@ -571,17 +628,108 @@ class ForwardingService:
                 reverse=False,
             ):
                 text = sink_msg.text or sink_msg.message or ""
-                found = extract_number_tag(text)
-                if found == number_tag:
-                    return sink_msg
+                sink_number = extract_number_tag(text)
+                # Сначала отсекаем заведомо другие номера — меньше скачиваний медиа
+                if number_tag is not None and sink_number is not None and sink_number != number_tag:
+                    continue
+                try:
+                    album = await self._collect_album(sink_msg) if sink_msg.grouped_id else None
+                    fp = await self._message_fingerprint(sink_msg, album)
+                    if fp == fingerprint:
+                        return sink_msg
+                except Exception:
+                    continue
         except Exception as exc:
             self.logger.warning(
-                "sink_dedup_scan_failed",
+                "sink_fingerprint_scan_failed",
                 sink_chat_id=sink_chat_id,
-                number_tag=number_tag,
                 error=str(exc),
             )
         return None
+
+    async def resync_chain_mappings(self, chain_id: int) -> int:
+        """
+        После загрузки бэкапа: для постов источника, которых нет в message_map,
+        но такой же контент уже есть в приёмнике — записываем mapping в SQL.
+        Последовательность продолжается с реального места, без дублей и без пропуска
+        разных картинок с одним #N.
+        """
+        synced = 0
+        async with get_session() as session:
+            chain = await ChainRepository(session).get_by_id(chain_id)
+            if chain is None or chain.status != models.ChainStatus.ACTIVE:
+                return 0
+
+            msg_map_repo = MessageMapRepository(session)
+            last_mapping = await msg_map_repo.get_last_for_chain(chain.id)
+            start_from_id = last_mapping.source_msg_id if last_mapping else 0
+
+            sink_index = await self._build_sink_fingerprint_index(chain.sink_chat_id)
+            if not sink_index:
+                self.logger.warning("resync_empty_sink_index", chain_id=chain_id)
+                return 0
+
+            candidates = await self._collect_candidates(
+                chain.source_chat_id,
+                bypass_pickup_delay=True,
+                start_from_id=start_from_id,
+            )
+            last_number = last_mapping.number_tag if last_mapping else chain.start_number
+
+            for msg_id, message in sorted(candidates.items(), key=lambda x: x[0]):
+                existing = await msg_map_repo.get_by_source(chain.id, msg_id)
+                if existing:
+                    continue
+                number = extract_number_tag(message.text or message.message)
+                if number is None:
+                    continue
+                media_group = await self._collect_album(message) if message.grouped_id else None
+                try:
+                    fp = await self._message_fingerprint(message, media_group)
+                except Exception:
+                    continue
+                sink_msg = sink_index.get(fp)
+                if sink_msg is None:
+                    continue
+                await self._register_without_send(
+                    chain=chain,
+                    message=message,
+                    media_group=media_group,
+                    number_tag=number,
+                    sink_msg_id=sink_msg.id,
+                    sink_msg_date=self._ensure_aware(sink_msg.date),
+                    session=session,
+                )
+                last_number = number
+                synced += 1
+                self.logger.info(
+                    "resync_mapped_existing_sink",
+                    chain_id=chain_id,
+                    source_msg_id=msg_id,
+                    sink_msg_id=sink_msg.id,
+                    number_tag=number,
+                )
+
+            if synced:
+                await ChainRepository(session).advance_pointer(
+                    chain_id=chain.id,
+                    next_expected_number=last_number + 1,
+                    last_sent_number=last_number,
+                )
+
+        self.logger.info("resync_chain_done", chain_id=chain_id, synced=synced)
+        return synced
+
+    async def resync_all_active_chains(self) -> int:
+        async with get_session() as session:
+            chains = await ChainRepository(session).list_active()
+        total = 0
+        for chain in chains:
+            try:
+                total += await self.resync_chain_mappings(chain.id)
+            except Exception as exc:
+                self.logger.error("resync_chain_failed", chain_id=chain.id, error=str(exc))
+        return total
 
     async def _register_without_send(
         self,

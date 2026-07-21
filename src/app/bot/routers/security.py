@@ -146,6 +146,9 @@ async def security_restore_document(message: Message, state: FSMContext) -> None
                 scheduler.remove(job_id)
 
         forwarding = ForwardingService(message.bot)
+        await message.answer("🔄 Синхронизирую уже опубликованные посты с базой...")
+        synced = await forwarding.resync_all_active_chains()
+
         async with get_session() as session:
             chains = await ChainRepository(session).list_active()
         for chain in chains:
@@ -171,9 +174,10 @@ async def security_restore_document(message: Message, state: FSMContext) -> None
         await message.answer(
             "✅ База успешно загружена и применена.\n"
             f"Копия старой БД: <code>{safety_path}</code>\n"
-            f"Активных цепочек после загрузки: <b>{len(chains)}</b>\n\n"
-            "Проверьте Telethon-аккаунты и цепочки в меню.",
-            reply_markup=security_menu_keyboard().as_markup(),
+            f"Активных цепочек: <b>{len(chains)}</b>\n"
+            f"Синхронизировано уже отправленных постов в SQL: <b>{synced}</b>\n\n"
+            "Главное меню:",
+            reply_markup=main_menu_keyboard().as_markup(),
         )
     except Exception as exc:
         await message.answer(f"❌ Не удалось загрузить базу: {exc}")
