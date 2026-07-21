@@ -40,11 +40,16 @@ async def security_backup_to_chat(callback: CallbackQuery) -> None:
         filename = await backup.send_backup_to_chat(chat_id, reason="manual")
         if callback.message:
             await callback.message.answer(
-                f"✅ База отправлена в этот чат.\nФайл: <code>{filename}</code>"
+                f"✅ База отправлена в этот чат.\nФайл: <code>{filename}</code>\n\n"
+                "Главное меню:",
+                reply_markup=main_menu_keyboard().as_markup(),
             )
     except Exception as exc:
         if callback.message:
-            await callback.message.answer(f"❌ Не удалось создать бэкап: {exc}")
+            await callback.message.answer(
+                f"❌ Не удалось создать бэкап: {exc}\n\nГлавное меню:",
+                reply_markup=main_menu_keyboard().as_markup(),
+            )
 
 
 @router.callback_query(F.data == "security:backup", authorized_filter)

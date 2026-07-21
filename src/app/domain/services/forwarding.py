@@ -30,6 +30,7 @@ from app.domain.services.text_sanitizer import sanitize
 NUMBER_PATTERN = re.compile(r"(?<!\w)#(\d{1,10})\b")
 MAX_HISTORY_SCAN = 2000
 START_SEARCH_LIMIT = 10000
+SINK_DEDUP_SCAN = 200
 
 history_limiters = RateLimiterSet()
 
@@ -409,6 +410,45 @@ class ForwardingService:
             self._log_chain_skipped(chain.id, "message_without_number", source_msg_id=message.id)
             return
 
+        # Уже есть в БД по номеру (на случай рассинхрона source_msg_id).
+        existing_by_number = await repository.get_last_by_number(chain.id, number_tag)
+        if existing_by_number is not None:
+            await ChainRepository(session).advance_pointer(
+                chain_id=chain.id,
+                next_expected_number=number_tag + 1,
+                last_sent_number=number_tag,
+            )
+            self._log_chain_skipped(
+                chain.id,
+                "already_published_by_number",
+                source_msg_id=message.id,
+                number_tag=number_tag,
+                sink_msg_id=existing_by_number.sink_msg_id,
+            )
+            return
+
+        # Пост уже в приёмнике (после отката БД) — не дублируем, только синхронизируем карту.
+        sink_existing = await self._find_number_in_sink(chain.sink_chat_id, number_tag)
+        if sink_existing is not None:
+            media_group = await self._collect_album(message) if message.grouped_id else None
+            await self._register_without_send(
+                chain=chain,
+                message=message,
+                media_group=media_group,
+                number_tag=number_tag,
+                sink_msg_id=sink_existing.id,
+                sink_msg_date=self._ensure_aware(sink_existing.date),
+                session=session,
+            )
+            self.logger.info(
+                "duplicate_avoided_sink_match",
+                chain_id=chain.id,
+                source_msg_id=message.id,
+                sink_msg_id=sink_existing.id,
+                number_tag=number_tag,
+            )
+            return
+
         media_group = await self._collect_album(message) if message.grouped_id else None
 
         sent_messages = None
@@ -520,6 +560,70 @@ class ForwardingService:
             source_msg_id=message.id,
             sink_msg_id=sent_messages[0].message_id if sent_messages else None,
             number_tag=number_tag,
+        )
+
+    async def _find_number_in_sink(self, sink_chat_id: int, number_tag: int) -> Optional[TlMessage]:
+        """Ищет в приёмнике уже опубликованный пост с тем же #N. Ошибки не роняют цепочку."""
+        try:
+            async for sink_msg in account_manager.iter_messages(
+                sink_chat_id,
+                limit=SINK_DEDUP_SCAN,
+                reverse=False,
+            ):
+                text = sink_msg.text or sink_msg.message or ""
+                found = extract_number_tag(text)
+                if found == number_tag:
+                    return sink_msg
+        except Exception as exc:
+            self.logger.warning(
+                "sink_dedup_scan_failed",
+                sink_chat_id=sink_chat_id,
+                number_tag=number_tag,
+                error=str(exc),
+            )
+        return None
+
+    async def _register_without_send(
+        self,
+        *,
+        chain: models.Chain,
+        message: TlMessage,
+        media_group: Optional[List[TlMessage]],
+        number_tag: int,
+        sink_msg_id: int,
+        sink_msg_date: datetime,
+        session: AsyncSession,
+    ) -> None:
+        mapper = MappingService(session)
+        media_type = self._deduce_media_type(message, media_group)
+        if media_group and len(media_group) > 1:
+            for album_msg in media_group:
+                already = await MessageMapRepository(session).get_by_source(chain.id, album_msg.id)
+                if already:
+                    continue
+                await mapper.register(
+                    chain_id=chain.id,
+                    source_msg_id=album_msg.id,
+                    source_msg_date=self._ensure_aware(album_msg.date),
+                    sink_msg_id=sink_msg_id,
+                    sink_msg_date=sink_msg_date,
+                    number_tag=number_tag,
+                    media_type=media_type,
+                )
+        else:
+            await mapper.register(
+                chain_id=chain.id,
+                source_msg_id=message.id,
+                source_msg_date=self._ensure_aware(message.date),
+                sink_msg_id=sink_msg_id,
+                sink_msg_date=sink_msg_date,
+                number_tag=number_tag,
+                media_type=media_type,
+            )
+        await ChainRepository(session).advance_pointer(
+            chain_id=chain.id,
+            next_expected_number=number_tag + 1,
+            last_sent_number=number_tag,
         )
 
     def _ensure_aware(self, dt: datetime) -> datetime:
