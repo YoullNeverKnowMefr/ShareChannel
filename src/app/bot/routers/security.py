@@ -107,6 +107,7 @@ async def security_restore_document(message: Message, state: FSMContext) -> None
     from app.domain.services.backup_service import BackupService
     from app.domain.services.forwarding import ForwardingService
     from app.core.db import get_session
+    from app.config import settings
 
     document = message.document
     if document is None:
@@ -133,17 +134,18 @@ async def security_restore_document(message: Message, state: FSMContext) -> None
     )
     try:
         await message.bot.download(document, destination=tmp_path)
+
+        # Сначала останавливаем фоновые писатели, иначе подмена файла ломает SQLite.
+        for job in list(scheduler.scheduler.get_jobs()):
+            job_id = str(job.id)
+            if job_id.startswith("chain:") or job_id.startswith("db_backup"):
+                scheduler.remove(job_id)
+        await account_manager.stop()
+
         backup = BackupService(message.bot)
         safety_path = await backup.restore_from_path(tmp_path)
 
-        # Перезапуск пула аккаунтов и расписания цепочек под новую БД
-        await account_manager.stop()
         await account_manager.start()
-
-        for job in list(scheduler.scheduler.get_jobs()):
-            job_id = str(job.id)
-            if job_id.startswith("chain:"):
-                scheduler.remove(job_id)
 
         forwarding = ForwardingService(message.bot)
         await message.answer("🔄 Синхронизирую уже опубликованные посты с базой...")
@@ -163,6 +165,15 @@ async def security_restore_document(message: Message, state: FSMContext) -> None
                 job_id=f"chain:{chain.id}:bootstrap",
                 run_date=datetime.now(timezone.utc) + timedelta(seconds=random.uniform(1, 5)),
                 kwargs={"chain_id": chain.id},
+            )
+
+        if settings.backup_chat_id is not None:
+            interval_seconds = max(30.0, settings.backup_interval_minutes * 60.0)
+            backup_service = BackupService(message.bot)
+            scheduler.add_interval_job(
+                backup_service.run_scheduled_backup,
+                job_id="db_backup",
+                seconds=interval_seconds,
             )
 
         data = await state.get_data()

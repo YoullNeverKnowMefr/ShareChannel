@@ -141,7 +141,7 @@ async def pause_chain(callback: CallbackQuery, state: FSMContext) -> None:
     async with get_session() as session:
         repo = ChainRepository(session)
         await repo.update_status(chain_id, ChainStatus.PAUSED)
-    scheduler.remove(f"chain:{chain_id}")
+    scheduler.remove_jobs_for_chain(chain_id)
     await callback.answer("Цепочка поставлена на паузу")
     await view_chain(callback, state)
 
@@ -162,54 +162,65 @@ async def resume_chain(callback: CallbackQuery, state: FSMContext, **kwargs) -> 
 @router.callback_query(F.data.startswith("chains:delete:confirm:"), authorized_filter)
 async def delete_chain_confirm(callback: CallbackQuery) -> None:
     chain_id = int(callback.data.split(":")[-1])
-    
-    async with get_session() as session:
-        repo = ChainRepository(session)
-        chain = await repo.get_by_id(chain_id)
-        if not chain:
-            await callback.answer("Цепочка не найдена", show_alert=True)
-            return
-            
-        category_id = chain.category_id
-        shop_id = chain.shop_id
-        await repo.delete(chain_id)
-    
-    scheduler.remove(f"chain:{chain_id}")
-    
+    await callback.answer("Удаляю...")
+
+    try:
+        async with get_session() as session:
+            repo = ChainRepository(session)
+            chain = await repo.get_by_id(chain_id)
+            if not chain:
+                if callback.message:
+                    await callback.message.answer("Цепочка не найдена")
+                return
+
+            category_id = chain.category_id
+            shop_id = chain.shop_id
+            await repo.delete(chain_id)
+
+        scheduler.remove_jobs_for_chain(chain_id)
+        logger.info("chain_deleted", chain_id=chain_id)
+    except Exception as exc:
+        logger.error("chain_delete_failed", chain_id=chain_id, error=str(exc), exc_info=True)
+        if callback.message:
+            await callback.message.answer(f"❌ Не удалось удалить цепочку: {exc}")
+        return
+
     if callback.message:
-        if category_id:
-            async with get_session() as session:
-                from app.domain.repositories import CategoryRepository
-                cat_repo = CategoryRepository(session)
-                chain_repo = ChainRepository(session)
-                
-                category = await cat_repo.get_by_id(category_id)
-                if category:
-                    chains = await chain_repo.list_by_category(category_id)
-                    subcategories = await cat_repo.list_by_parent(category_id)
-                    has_subcategories = len(subcategories) > 0
-                    
-                    text = (
-                        f"✅ Цепочка удалена\n\n"
-                        f"📂 {category.name}\n"
-                        f"Цепочек: {len(chains)}"
-                    )
-                    
-                    from app.bot.keyboards import category_card_keyboard
-                    from app.domain.dto import CategoryDTO
-                    await callback.message.edit_text(
-                        text,
-                        reply_markup=category_card_keyboard(
-                            CategoryDTO.model_validate(category),
-                            [ChainDTO.model_validate(c) for c in chains],
-                            subcategories=[CategoryDTO.model_validate(c) for c in subcategories] if has_subcategories else None
-                        ).as_markup(),
-                    )
-        else:
+        try:
+            if category_id:
+                async with get_session() as session:
+                    from app.domain.repositories import CategoryRepository
+                    cat_repo = CategoryRepository(session)
+                    chain_repo = ChainRepository(session)
+
+                    category = await cat_repo.get_by_id(category_id)
+                    if category:
+                        chains = await chain_repo.list_by_category(category_id)
+                        subcategories = await cat_repo.list_by_parent(category_id)
+                        has_subcategories = len(subcategories) > 0
+
+                        text = (
+                            f"✅ Цепочка удалена\n\n"
+                            f"📂 {category.name}\n"
+                            f"Цепочек: {len(chains)}"
+                        )
+
+                        from app.bot.keyboards import category_card_keyboard
+                        from app.domain.dto import CategoryDTO
+                        await callback.message.edit_text(
+                            text,
+                            reply_markup=category_card_keyboard(
+                                CategoryDTO.model_validate(category),
+                                [ChainDTO.model_validate(c) for c in chains],
+                                subcategories=[CategoryDTO.model_validate(c) for c in subcategories] if has_subcategories else None
+                            ).as_markup(),
+                        )
+                        return
+
             async with get_session() as session:
                 from app.domain.repositories import ShopRepository
                 shop_repo = ShopRepository(session)
-                
+
                 shop = await shop_repo.get_by_id(shop_id)
                 if shop:
                     text = (
@@ -217,24 +228,31 @@ async def delete_chain_confirm(callback: CallbackQuery) -> None:
                         f"Магазин «{shop.name}»\n"
                         f"Владелец: {shop.owner_tg_id}"
                     )
-                    
+
                     from app.bot.keyboards import shop_card_keyboard
                     await callback.message.edit_text(
                         text,
                         reply_markup=shop_card_keyboard(shop.id).as_markup(),
                     )
-    
-    await callback.answer("Удалено")
+                    return
+
+            await callback.message.edit_text("✅ Цепочка удалена")
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc):
+                logger.warning("chain_delete_ui_update_failed", error=str(exc))
+                await callback.message.answer("✅ Цепочка удалена")
 
 
 @router.callback_query(F.data.startswith("chains:delete:cancel:"), authorized_filter)
 async def delete_chain_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    chain_id = int(callback.data.split(":")[-1])
     await view_chain(callback, state)
     await callback.answer("Отменено")
 
 
-@router.callback_query(F.data.startswith("chains:delete:"), authorized_filter)
+@router.callback_query(
+    F.data.regexp(r"^chains:delete:\d+$"),
+    authorized_filter,
+)
 async def delete_chain_prompt(callback: CallbackQuery) -> None:
     chain_id = int(callback.data.split(":")[-1])
     if callback.message:
@@ -292,7 +310,7 @@ async def check_permissions(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def reschedule_chain(data: dict, chain_id: int, interval_seconds: int) -> None:
     forwarding: ForwardingService = _get_forwarding_service(data)
-    scheduler.remove(f"chain:{chain_id}")
+    scheduler.remove_jobs_for_chain(chain_id)
     scheduler.add_interval_job(
         forwarding.process_chain,
         job_id=f"chain:{chain_id}",
