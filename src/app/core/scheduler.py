@@ -79,6 +79,13 @@ class Scheduler:
         except Exception:
             logger.warning("scheduler_job_remove_failed", job_id=job_id)
 
+    def remove_jobs_for_chain(self, chain_id: int) -> None:
+        prefix = f"chain:{chain_id}"
+        for job in list(self.scheduler.get_jobs()):
+            job_id = str(job.id)
+            if job_id == prefix or job_id.startswith(f"{prefix}:"):
+                self.remove(job_id)
+
 
 scheduler = Scheduler()
 
