@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.types import Update
+from aiogram.types import BotCommand, Update
 from telethon import events
 
 from app.bot import create_dispatcher
@@ -23,6 +23,18 @@ from app.domain.services.account_manager import account_manager
 from app.domain.services.notifications import NotificationService, set_notifier
 
 logger = get_logger(__name__)
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Перезапустить бота / открыть меню"),
+            BotCommand(command="menu", description="Главное меню"),
+            BotCommand(command="restart", description="Полный перезапуск процесса бота"),
+            BotCommand(command="shops", description="Магазины"),
+        ]
+    )
+    logger.info("bot_commands_registered")
 
 
 async def schedule_existing_chains(forwarding: ForwardingService) -> None:
@@ -141,6 +153,8 @@ async def main() -> None:
 
     account_manager.add_event_handler(new_message_handler, events.NewMessage())
     account_manager.add_event_handler(deleted_handler, events.MessageDeleted())
+
+    await setup_bot_commands(bot)
 
     try:
         await dp.start_polling(bot)
