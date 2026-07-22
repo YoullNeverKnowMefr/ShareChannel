@@ -112,7 +112,8 @@ async def main() -> None:
     backup_service = BackupService(bot)
     dp["backup_service"] = backup_service
     if settings.backup_chat_id is not None:
-        interval_seconds = max(1.0, settings.backup_interval_hours) * 3600
+        # По умолчанию каждые 2 минуты (минимум 30 секунд)
+        interval_seconds = max(30.0, settings.backup_interval_minutes * 60.0)
         scheduler.add_interval_job(
             backup_service.run_scheduled_backup,
             job_id="db_backup",
@@ -121,12 +122,13 @@ async def main() -> None:
         scheduler.add_one_off_job(
             backup_service.run_scheduled_backup,
             job_id="db_backup:bootstrap",
-            run_date=datetime.now(timezone.utc) + timedelta(minutes=2),
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=min(60.0, interval_seconds)),
         )
         logger.info(
             "backup_scheduler_enabled",
             chat_id=settings.backup_chat_id,
-            interval_hours=settings.backup_interval_hours,
+            interval_minutes=settings.backup_interval_minutes,
+            interval_seconds=interval_seconds,
         )
     else:
         logger.warning("backup_scheduler_disabled", reason="BACKUP_CHAT_ID not set")
