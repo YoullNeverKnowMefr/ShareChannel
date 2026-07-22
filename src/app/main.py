@@ -11,7 +11,7 @@ from telethon import events
 
 from app.bot import create_dispatcher
 from app.config import settings
-from app.core.db import get_session
+from app.core.db import dispose_engine, get_session
 from app.core.logging import configure_logging, get_logger
 from app.core.scheduler import scheduler
 from app.domain.models import ChainStatus
@@ -160,9 +160,6 @@ async def main() -> None:
         scheduler.shutdown()
         await account_manager.stop()
         try:
-            from app.core.db import dispose_engine
-            from app.domain.services.backup_service import BackupService
-
             # Checkpoint WAL перед выходом — меньше шанс битой БД после kill/ребута.
             backup = BackupService(bot)
             db_path = backup.resolve_db_path()
