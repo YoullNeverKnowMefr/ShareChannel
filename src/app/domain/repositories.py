@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain import models
@@ -241,9 +241,13 @@ class ChainRepository:
         )
 
     async def delete(self, chain_id: int) -> None:
-        chain = await self.get_by_id(chain_id)
-        if chain:
-            await self.session.delete(chain)
+        # Быстрое удаление без загрузки всех message_map в память
+        await self.session.execute(
+            delete(models.MessageMap).where(models.MessageMap.chain_id == chain_id)
+        )
+        await self.session.execute(
+            delete(models.Chain).where(models.Chain.id == chain_id)
+        )
 
 
 class MessageMapRepository:
