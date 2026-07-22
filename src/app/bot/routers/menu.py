@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import sys
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -22,6 +26,13 @@ async def menu_command(message: Message, state: FSMContext) -> None:
         "Главное меню:",
         reply_markup=main_menu_keyboard().as_markup(),
     )
+
+
+@router.message(Command("restart"), authorized_filter)
+async def restart_command(message: Message) -> None:
+    await message.answer("♻️ Полный перезапуск процесса бота...")
+    await asyncio.sleep(0.5)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 @router.message(F.text == "◀️ Назад", authorized_filter)

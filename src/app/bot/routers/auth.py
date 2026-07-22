@@ -70,7 +70,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     if is_authorized:
         await state.update_data(authorized=True)
-        await message.answer("Главное меню:", reply_markup=reply_back_keyboard())
+        await message.answer(
+            "♻️ Бот перезапущен.\nГлавное меню:",
+            reply_markup=reply_back_keyboard(),
+        )
         await message.answer("Выберите раздел:", reply_markup=main_menu_keyboard().as_markup())
         logger.info("main_menu_sent", user_id=user_id)
         return
