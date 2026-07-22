@@ -30,8 +30,6 @@ async def setup_bot_commands(bot: Bot) -> None:
         [
             BotCommand(command="start", description="Перезапустить бота / открыть меню"),
             BotCommand(command="menu", description="Главное меню"),
-            BotCommand(command="restart", description="Полный перезапуск процесса бота"),
-            BotCommand(command="shops", description="Магазины"),
         ]
     )
     logger.info("bot_commands_registered")
