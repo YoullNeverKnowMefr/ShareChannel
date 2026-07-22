@@ -159,6 +159,17 @@ async def main() -> None:
     finally:
         scheduler.shutdown()
         await account_manager.stop()
+        try:
+            from app.core.db import dispose_engine
+            from app.domain.services.backup_service import BackupService
+
+            # Checkpoint WAL перед выходом — меньше шанс битой БД после kill/ребута.
+            backup = BackupService(bot)
+            db_path = backup.resolve_db_path()
+            await asyncio.to_thread(backup._checkpoint_and_close_side_files, db_path)
+            await dispose_engine()
+        except Exception as exc:
+            logger.warning("sqlite_shutdown_checkpoint_failed", error=str(exc))
 
 
 if __name__ == "__main__":
